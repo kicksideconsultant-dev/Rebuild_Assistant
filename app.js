@@ -1,10 +1,14 @@
+// app.js (FULL)
 // =====================================================
-// FFTH Rebuild Helper (Client-side) - UPDATED
-// New features:
-// - Search/filter (house number + street)
-// - Street dropdown
-// - Bulk add per ST_NAME (queue)
-// - Skip / Undo last add / Stop bulk
+// FFTH Rebuild Helper (Client-side)
+// Features:
+// - Upload CSV (ABD Existing) + KMZ (ABD KMZ)
+// - Auto-match based on normalized house number: ST_NUM <-> Placemark.name
+// - Tabs Missing / Matched / All
+// - Search + filter by ST_NAME
+// - Bulk mode by ST_NAME (queue) for fast clicking points on map (LOCAL markers)
+// - EXPORT: keeps original ABD KMZ structure unchanged; ONLY adds folder:
+//   REBUILD_HELPER/MATCHED containing "tag" markers for matched rows.
 // =====================================================
 
 const $ = (id) => document.getElementById(id);
@@ -30,20 +34,20 @@ const selInfo = $("selInfo");
 const bulkInfo = $("bulkInfo");
 
 let map, layerKMZ, layerAdded;
-let csvRows = [];            // raw ABD Existing rows
-let kmzPoints = [];          // {name, norm, lat, lng, placemarkNode}
-let kmlDoc = null;           // parsed XML Document
-let homeFolderNode = null;   // <Folder> node for HOME
+let csvRows = [];
+let kmzPoints = [];
+let kmlDoc = null;
+let kmzKmlName = "doc.kml"; // will be set from KMZ
+let matches = [];
+let addedPoints = []; // local-only markers: { rowIndex, lat, lng, marker }
 
-let matches = [];            // {row, matchPoint|null, status, reason, addedLat?, addedLng?}
-let addedPoints = [];        // { rowIndex, lat, lng, marker }
 let currentTab = "missing";
 let selectedRowKey = null;
 
 let bulkMode = {
   active: false,
-  queue: [],       // array of rowIndex
-  pointer: 0,      // current index in queue
+  queue: [],
+  pointer: 0,
   street: ""
 };
 
@@ -59,7 +63,7 @@ function initMap() {
   layerAdded = L.layerGroup().addTo(map);
 
   map.on("click", (e) => {
-    // Determine which row is currently "target" for adding
+    // LOCAL marker add only (does NOT export into KMZ structure)
     const targetIdx = getTargetAddRowIndex();
     if (targetIdx === null) return;
 
@@ -68,25 +72,20 @@ function initMap() {
 
     const { lat, lng } = e.latlng;
 
-    // Add or replace marker for this row
     const existingAdded = addedPoints.find(x => x.rowIndex === targetIdx);
     if (existingAdded) {
-      // replace position
       existingAdded.lat = lat;
       existingAdded.lng = lng;
       if (existingAdded.marker) existingAdded.marker.setLatLng([lat, lng]);
     } else {
       const mk = L.circleMarker([lat, lng], { radius: 7 }).addTo(layerAdded);
-      mk.bindPopup(renderPopupForRow(m.row, "HP ADDED"));
+      mk.bindPopup(renderPopupForRow(m.row, "LOCAL CLICK"));
       addedPoints.push({ rowIndex: targetIdx, lat, lng, marker: mk });
     }
 
-    // Update status
-    m.status = "ADDED";
-    m.addedLat = lat;
-    m.addedLng = lng;
-
-    // Auto-advance bulk
+    // keep status as MISSING / REVIEW_ADD (since we are not exporting ADDED)
+    // but you can still use this to guide your manual editing.
+    // If you want later: export ADDED folder too, say the word.
     if (bulkMode.active) {
       bulkMode.pointer += 1;
       const nextIdx = getBulkCurrentRowIndex();
@@ -94,21 +93,18 @@ function initMap() {
         selectedRowKey = nextIdx;
         zoomToRow(nextIdx);
       } else {
-        // finished
         stopBulk("Bulk selesai ✅");
       }
     }
 
     renderTable();
     refreshHUD();
-    setStatus(`Added HP for row index=${targetIdx}.`);
+    setStatus(`Local mark placed for row index=${targetIdx}. (Tidak diexport ke KMZ)`);
   });
 }
 
 function getTargetAddRowIndex() {
-  if (bulkMode.active) {
-    return getBulkCurrentRowIndex();
-  }
+  if (bulkMode.active) return getBulkCurrentRowIndex();
   if (selectedRowKey === null) return null;
   const m = matches[selectedRowKey];
   if (!m) return null;
@@ -134,7 +130,6 @@ function normalizeHouse(s) {
   t = t.replace(/[._]/g, "");
   t = t.replace(/–/g, "-").replace(/—/g, "-");
   t = t.replace(/-/g, "");
-
   const m = t.match(/^(\d+)(.*)$/);
   if (m) {
     const num = String(parseInt(m[1], 10));
@@ -148,6 +143,15 @@ function safeGet(row, key) {
   return row && Object.prototype.hasOwnProperty.call(row, key) ? row[key] : "";
 }
 
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
 function renderPopupForRow(row, title) {
   const stNum = safeGet(row, "ST_NUM");
   const stName = safeGet(row, "ST_NAME");
@@ -156,11 +160,11 @@ function renderPopupForRow(row, title) {
   const block = safeGet(row, "BLOCK");
   return `
     <div style="font-family:Arial;font-size:13px;">
-      <b>${title}</b><br/>
-      <b>No:</b> ${stNum || "-"}<br/>
-      <b>Jalan:</b> ${stName || "-"}<br/>
-      <b>RT/RW:</b> ${rt || "-"} / ${rw || "-"}<br/>
-      <b>Block:</b> ${block || "-"}<br/>
+      <b>${escapeHtml(title)}</b><br/>
+      <b>No:</b> ${escapeHtml(stNum || "-")}<br/>
+      <b>Jalan:</b> ${escapeHtml(stName || "-")}<br/>
+      <b>RT/RW:</b> ${escapeHtml(rt || "-")} / ${escapeHtml(rw || "-")}<br/>
+      <b>Block:</b> ${escapeHtml(block || "-")}<br/>
     </div>
   `;
 }
@@ -169,18 +173,13 @@ function zoomToRow(idx) {
   const m = matches[idx];
   if (!m) return;
 
-  // If has matched point in KMZ
   if (m.matchPoint) {
     map.setView([m.matchPoint.lat, m.matchPoint.lng], 18);
     return;
   }
 
-  // If already added
   const ap = addedPoints.find(x => x.rowIndex === idx);
-  if (ap) {
-    map.setView([ap.lat, ap.lng], 18);
-    return;
-  }
+  if (ap) map.setView([ap.lat, ap.lng], 18);
 }
 
 // ---------------------- CSV ----------------------
@@ -202,17 +201,9 @@ function populateStreetSelect(rows) {
     if (st) set.add(st);
   });
   const streets = Array.from(set).sort((a, b) => a.localeCompare(b, "id"));
-  streetSelect.innerHTML = `<option value="">(All streets)</option>` +
+  streetSelect.innerHTML =
+    `<option value="">(All streets)</option>` +
     streets.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join("");
-}
-
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }
 
 // ---------------------- KMZ / KML ----------------------
@@ -229,9 +220,7 @@ function parseXML(text) {
   const p = new DOMParser();
   const doc = p.parseFromString(text, "application/xml");
   const parseError = doc.getElementsByTagName("parsererror");
-  if (parseError && parseError.length) {
-    throw new Error("Gagal parse KML (parsererror).");
-  }
+  if (parseError && parseError.length) throw new Error("Gagal parse KML (parsererror).");
   return doc;
 }
 
@@ -274,6 +263,7 @@ function extractPlacemarkPoints(folderOrDoc) {
     const coordText = coordNode.textContent.trim();
     const parts = coordText.split(",").map((x) => x.trim());
     if (parts.length < 2) continue;
+
     const lng = Number(parts[0]);
     const lat = Number(parts[1]);
     if (!isFinite(lat) || !isFinite(lng)) continue;
@@ -297,12 +287,10 @@ function drawKMZPoints(points) {
     mk.bindPopup(`<b>KMZ HP</b><br/>${escapeHtml(p.name || "-")}`);
     latlngs.push([p.lat, p.lng]);
   });
-  if (latlngs.length) {
-    map.fitBounds(L.latLngBounds(latlngs).pad(0.15));
-  }
+  if (latlngs.length) map.fitBounds(L.latLngBounds(latlngs).pad(0.15));
 }
 
-// ---------------------- Auto-match rules ----------------------
+// ---------------------- Auto-match ----------------------
 function autoMatch(rows, points) {
   const kmzIndex = new Map();
   for (const p of points) {
@@ -324,7 +312,7 @@ function autoMatch(rows, points) {
       return { row, matchPoint: candidates[0], status: "REVIEW", reason: "DUPLICATE_KMZ" };
     }
 
-    // Numeric-only fallback -> REVIEW_ADD (we still want you to verify/add if needed)
+    // numeric-only fallback
     const m = key.match(/^(\d+)/);
     if (m) {
       const numOnly = m[1];
@@ -338,106 +326,7 @@ function autoMatch(rows, points) {
   });
 }
 
-// ---------------------- KML update helpers ----------------------
-function applyUpdatesToExistingKMZ() {
-  for (const m of matches) {
-    if (m.status !== "MATCHED" && m.status !== "REVIEW" && m.status !== "REVIEW_ADD") continue;
-    if (!m.matchPoint || !m.matchPoint.placemarkNode) continue;
-    upsertExtendedData(m.matchPoint.placemarkNode, m.row);
-  }
-}
-
-function upsertExtendedData(placemarkNode, row) {
-  let ext = placemarkNode.getElementsByTagName("ExtendedData")[0];
-  if (!ext) {
-    ext = kmlDoc.createElement("ExtendedData");
-    placemarkNode.appendChild(ext);
-  }
-
-  const fields = ["ST_NAME","ST_NUM","BLOCK","FRACT","OV_UG","RT","RW"];
-  fields.forEach((f) => {
-    const val = safeGet(row, f);
-    if (val === undefined || val === null || String(val).trim() === "") return;
-    upsertData(ext, f, String(val));
-  });
-
-  upsertData(ext, "SOURCE", "ABD_EXISTING");
-}
-
-function upsertData(extendedNode, name, value) {
-  const datas = Array.from(extendedNode.getElementsByTagName("Data"));
-  let node = datas.find((d) => (d.getAttribute("name") || "").toUpperCase() === name.toUpperCase());
-  if (!node) {
-    node = kmlDoc.createElement("Data");
-    node.setAttribute("name", name);
-    const v = kmlDoc.createElement("value");
-    v.textContent = value;
-    node.appendChild(v);
-    extendedNode.appendChild(node);
-    return;
-  }
-  let v = node.getElementsByTagName("value")[0];
-  if (!v) {
-    v = kmlDoc.createElement("value");
-    node.appendChild(v);
-  }
-  v.textContent = value;
-}
-
-function ensureHomeFolder() {
-  homeFolderNode = findFolderByPath(kmlDoc, ["HP", "HOME"]);
-  if (homeFolderNode) return;
-
-  const docNode = kmlDoc.getElementsByTagName("Document")[0];
-  if (!docNode) throw new Error("KML tidak punya <Document> untuk menambahkan folder.");
-
-  const hpFolder = kmlDoc.createElement("Folder");
-  const hpName = kmlDoc.createElement("name");
-  hpName.textContent = "HP";
-  hpFolder.appendChild(hpName);
-
-  const homeFolder = kmlDoc.createElement("Folder");
-  const homeName = kmlDoc.createElement("name");
-  homeName.textContent = "HOME";
-  homeFolder.appendChild(homeName);
-
-  hpFolder.appendChild(homeFolder);
-  docNode.appendChild(hpFolder);
-
-  homeFolderNode = homeFolder;
-}
-
-function addPlacemarkToHome(row, lat, lng) {
-  const pm = kmlDoc.createElement("Placemark");
-
-  const name = kmlDoc.createElement("name");
-  name.textContent = String(safeGet(row, "ST_NUM") || "").trim();
-  pm.appendChild(name);
-
-  const ext = kmlDoc.createElement("ExtendedData");
-  pm.appendChild(ext);
-  ["ST_NAME","ST_NUM","BLOCK","FRACT","OV_UG","RT","RW"].forEach((f) => {
-    const val = safeGet(row, f);
-    if (val === undefined || val === null || String(val).trim() === "") return;
-    const d = kmlDoc.createElement("Data");
-    d.setAttribute("name", f);
-    const v = kmlDoc.createElement("value");
-    v.textContent = String(val);
-    d.appendChild(v);
-    ext.appendChild(d);
-  });
-  upsertData(ext, "SOURCE", "ADDED_BY_TOOL");
-
-  const point = kmlDoc.createElement("Point");
-  const coords = kmlDoc.createElement("coordinates");
-  coords.textContent = `${lng},${lat},0`;
-  point.appendChild(coords);
-  pm.appendChild(point);
-
-  homeFolderNode.appendChild(pm);
-}
-
-// ---------------------- Filter + Table ----------------------
+// ---------------------- Filters + Table ----------------------
 function setActiveTab(tab) {
   currentTab = tab;
   document.querySelectorAll(".tab").forEach((t) => {
@@ -451,27 +340,25 @@ function getFilteredMatches() {
 
   const q = (searchBox.value || "").trim().toUpperCase();
   const street = (streetSelect.value || "").trim();
-
   const view = viewSelect.value;
 
   let arr = matches.map((m, idx) => ({...m, __k: idx}));
 
-  // base from tab or override view
   if (view === "tab") {
     if (currentTab === "missing") arr = arr.filter(x => x.status === "MISSING" || x.status === "REVIEW_ADD");
     if (currentTab === "matched") arr = arr.filter(x => x.status === "MATCHED" || x.status === "REVIEW");
   } else if (view === "missing") {
     arr = arr.filter(x => x.status === "MISSING" || x.status === "REVIEW_ADD");
   } else if (view === "street_missing") {
-    arr = arr.filter(x => (x.status === "MISSING" || x.status === "REVIEW_ADD") && String(safeGet(x.row, "ST_NAME")||"").trim() === street);
+    arr = arr.filter(x => (x.status === "MISSING" || x.status === "REVIEW_ADD") &&
+      String(safeGet(x.row, "ST_NAME")||"").trim() === street
+    );
   }
 
-  // street filter (extra)
   if (street) {
     arr = arr.filter(x => String(safeGet(x.row, "ST_NAME")||"").trim() === street);
   }
 
-  // search filter
   if (q) {
     arr = arr.filter(x => {
       const stNum = String(safeGet(x.row, "ST_NUM") || "").toUpperCase();
@@ -522,8 +409,6 @@ function renderTable() {
     tr.addEventListener("click", () => {
       const k = Number(tr.dataset.k);
       selectedRowKey = k;
-
-      // when manual select, bulk stays but we don't override queue
       zoomToRow(k);
       renderTable();
       refreshHUD();
@@ -541,13 +426,10 @@ function startBulk() {
     return;
   }
 
-  // queue: all missing (or review_add) in this street, in the same order as CSV
   const q = [];
   matches.forEach((m, idx) => {
     const st = String(safeGet(m.row, "ST_NAME") || "").trim();
     if (st !== street) return;
-
-    // only those needing add
     if (m.status === "MISSING" || m.status === "REVIEW_ADD") q.push(idx);
   });
 
@@ -561,16 +443,15 @@ function startBulk() {
   bulkMode.pointer = 0;
   bulkMode.street = street;
 
-  // select first
   selectedRowKey = q[0];
   zoomToRow(selectedRowKey);
 
-  modePill.textContent = "BULK: Click map to add → auto next";
+  modePill.textContent = "BULK: Click map (LOCAL) → auto next";
   btnBulkSkip.disabled = false;
   btnUndo.disabled = false;
   btnBulkStop.disabled = false;
 
-  setStatus(`Bulk started: ${street}\nQueue: ${q.length} items.\nKlik map untuk menaruh titik HP, sistem akan lanjut otomatis.`);
+  setStatus(`Bulk started: ${street}\nQueue: ${q.length} items.\nKlik map untuk memberi tanda lokasi (LOCAL).`);
   renderTable();
   refreshHUD();
 }
@@ -581,7 +462,7 @@ function stopBulk(msg = "Bulk stopped.") {
   bulkMode.pointer = 0;
   bulkMode.street = "";
 
-  modePill.textContent = "Select row → Click map to add";
+  modePill.textContent = "Select row → Click map to add (local)";
   btnBulkSkip.disabled = true;
   btnBulkStop.disabled = true;
 
@@ -598,7 +479,7 @@ function skipCurrent() {
   if (nextIdx !== null) {
     selectedRowKey = nextIdx;
     zoomToRow(nextIdx);
-    setStatus("Skipped. Pilih titik berikutnya.");
+    setStatus("Skipped. Lanjut item berikutnya.");
     renderTable();
     refreshHUD();
   } else {
@@ -608,24 +489,13 @@ function skipCurrent() {
 
 function undoLastAdd() {
   if (!addedPoints.length) {
-    setStatus("Tidak ada add yang bisa di-undo.");
+    setStatus("Tidak ada local mark yang bisa di-undo.");
     return;
   }
-  // remove last added marker
   const last = addedPoints.pop();
   if (last.marker) layerAdded.removeLayer(last.marker);
 
-  // revert match status for that row if it was added
-  const m = matches[last.rowIndex];
-  if (m) {
-    m.status = m.matchPoint ? "REVIEW_ADD" : "MISSING";
-    delete m.addedLat;
-    delete m.addedLng;
-  }
-
-  // if bulk is active, move pointer back if last was current-1
   if (bulkMode.active) {
-    // best-effort: move pointer back one, but not below 0
     bulkMode.pointer = Math.max(0, bulkMode.pointer - 1);
     const cur = getBulkCurrentRowIndex();
     if (cur !== null) {
@@ -634,14 +504,13 @@ function undoLastAdd() {
     }
   }
 
-  setStatus("Undo last add ✅");
+  setStatus("Undo last local mark ✅");
   renderTable();
   refreshHUD();
 }
 
 // ---------------------- HUD ----------------------
 function refreshHUD() {
-  // selected info
   if (selectedRowKey === null || !matches[selectedRowKey]) {
     selInfo.textContent = "-";
   } else {
@@ -649,7 +518,6 @@ function refreshHUD() {
     selInfo.textContent = `${safeGet(r, "ST_NUM") || "-"} • ${safeGet(r, "ST_NAME") || "-"}`;
   }
 
-  // bulk info
   if (!bulkMode.active) {
     bulkInfo.textContent = "off";
   } else {
@@ -658,40 +526,153 @@ function refreshHUD() {
     bulkInfo.textContent = `${bulkMode.street} (${curPos}/${total})`;
   }
 
-  // enable bulk start if data loaded + street chosen
   btnBulkStart.disabled = !(matches.length && streetSelect.value);
   btnUndo.disabled = !addedPoints.length;
 
-  // update view hint in pill
   if (!bulkMode.active) {
     const m = (selectedRowKey !== null) ? matches[selectedRowKey] : null;
     if (m && (m.status === "MISSING" || m.status === "REVIEW_ADD")) {
-      modePill.textContent = "Click map to add for selected row";
+      modePill.textContent = "Click map to add (local) for selected row";
     } else {
-      modePill.textContent = "Select row → Click map to add";
+      modePill.textContent = "Select row → Click map to add (local)";
     }
   }
 }
 
-// ---------------------- Export KMZ ----------------------
-async function exportUpdatedKMZ(originalKmlName="doc.kml") {
-  applyUpdatesToExistingKMZ();
-  ensureHomeFolder();
+// ---------------------- EXPORT: add MATCHED folder only ----------------------
+function getDocumentNode() {
+  const docNode = kmlDoc.getElementsByTagName("Document")[0];
+  if (!docNode) throw new Error("KML tidak punya <Document>.");
+  return docNode;
+}
 
-  // Add each added row once
-  const addedByIdx = new Set();
-  for (const ap of addedPoints) {
-    if (addedByIdx.has(ap.rowIndex)) continue;
-    const m = matches[ap.rowIndex];
-    if (!m) continue;
-    addPlacemarkToHome(m.row, ap.lat, ap.lng);
-    addedByIdx.add(ap.rowIndex);
+function ensureStyle(id, kmlColorAABBGGRR, scale=1.1) {
+  const docNode = getDocumentNode();
+  const styles = Array.from(docNode.getElementsByTagName("Style"));
+  const exists = styles.find(s => (s.getAttribute("id") || "") === id);
+  if (exists) return;
+
+  const style = kmlDoc.createElement("Style");
+  style.setAttribute("id", id);
+
+  const iconStyle = kmlDoc.createElement("IconStyle");
+  const color = kmlDoc.createElement("color");
+  color.textContent = kmlColorAABBGGRR; // AABBGGRR
+  const sc = kmlDoc.createElement("scale");
+  sc.textContent = String(scale);
+
+  const icon = kmlDoc.createElement("Icon");
+  const href = kmlDoc.createElement("href");
+  href.textContent = "http://maps.google.com/mapfiles/kml/paddle/grn-blank.png";
+  icon.appendChild(href);
+
+  iconStyle.appendChild(color);
+  iconStyle.appendChild(sc);
+  iconStyle.appendChild(icon);
+  style.appendChild(iconStyle);
+
+  docNode.appendChild(style);
+}
+
+function ensureMatchFolderOnly() {
+  const docNode = getDocumentNode();
+
+  // REBUILD_HELPER (top)
+  let helper = Array.from(docNode.getElementsByTagName("Folder")).find(f => {
+    const n = f.getElementsByTagName("name")[0];
+    return n && n.textContent.trim() === "REBUILD_HELPER";
+  });
+
+  if (!helper) {
+    helper = kmlDoc.createElement("Folder");
+    const n = kmlDoc.createElement("name");
+    n.textContent = "REBUILD_HELPER";
+    helper.appendChild(n);
+    docNode.appendChild(helper);
+  }
+
+  // MATCHED subfolder
+  let matched = Array.from(helper.children).filter(x => x.tagName === "Folder").find(f => {
+    const n = f.getElementsByTagName("name")[0];
+    return n && n.textContent.trim() === "MATCHED";
+  });
+
+  if (!matched) {
+    matched = kmlDoc.createElement("Folder");
+    const n = kmlDoc.createElement("name");
+    n.textContent = "MATCHED";
+    matched.appendChild(n);
+    helper.appendChild(matched);
+  }
+
+  ensureStyle("ffthMatched", "ff00ff00", 1.1);
+  return { matched };
+}
+
+function makePointPlacemark(nameText, lat, lng, styleUrl, extendedPairs = {}) {
+  const pm = kmlDoc.createElement("Placemark");
+
+  const name = kmlDoc.createElement("name");
+  name.textContent = nameText;
+  pm.appendChild(name);
+
+  const su = kmlDoc.createElement("styleUrl");
+  su.textContent = styleUrl;
+  pm.appendChild(su);
+
+  const ext = kmlDoc.createElement("ExtendedData");
+  pm.appendChild(ext);
+  for (const [k, v] of Object.entries(extendedPairs)) {
+    if (v === undefined || v === null || String(v).trim() === "") continue;
+    const d = kmlDoc.createElement("Data");
+    d.setAttribute("name", k);
+    const val = kmlDoc.createElement("value");
+    val.textContent = String(v);
+    d.appendChild(val);
+    ext.appendChild(d);
+  }
+
+  const point = kmlDoc.createElement("Point");
+  const coords = kmlDoc.createElement("coordinates");
+  coords.textContent = `${lng},${lat},0`;
+  point.appendChild(coords);
+  pm.appendChild(point);
+
+  return pm;
+}
+
+async function exportKMZ_AddMatchedFolderOnly() {
+  // ✅ No edits to original HP placemarks/folders.
+  // ✅ Only adds REBUILD_HELPER/MATCHED "tag" markers.
+
+  const { matched } = ensureMatchFolderOnly();
+
+  // clear old MATCHED placemarks (so export ulang tidak numpuk)
+  Array.from(matched.children)
+    .filter(n => n.tagName === "Placemark")
+    .forEach(n => matched.removeChild(n));
+
+  for (const m of matches) {
+    if (m.status !== "MATCHED") continue;
+    if (!m.matchPoint) continue;
+
+    const stNum = safeGet(m.row, "ST_NUM");
+    const stName = safeGet(m.row, "ST_NAME");
+
+    const pm = makePointPlacemark(
+      `MATCHED - ${stNum || ""}`,
+      m.matchPoint.lat,
+      m.matchPoint.lng,
+      "#ffthMatched",
+      { ST_NUM: stNum, ST_NAME: stName, STATUS: "MATCHED", REASON: m.reason || "EXACT" }
+    );
+
+    matched.appendChild(pm);
   }
 
   const xml = new XMLSerializer().serializeToString(kmlDoc);
-
   const zip = new JSZip();
-  zip.file(originalKmlName, xml);
+  zip.file(kmzKmlName || "doc.kml", xml);
 
   const blob = await zip.generateAsync({ type: "blob" });
   const a = document.createElement("a");
@@ -703,20 +684,14 @@ async function exportUpdatedKMZ(originalKmlName="doc.kml") {
 
 // ---------------------- Wire UI ----------------------
 function wireControls() {
-  // tabs
   document.querySelectorAll(".tab").forEach((t) => {
     t.onclick = () => setActiveTab(t.dataset.tab);
   });
 
-  // filters
   searchBox.addEventListener("input", () => renderTable());
-  streetSelect.addEventListener("change", () => {
-    renderTable();
-    refreshHUD();
-  });
+  streetSelect.addEventListener("change", () => { renderTable(); refreshHUD(); });
   viewSelect.addEventListener("change", () => renderTable());
 
-  // bulk buttons
   btnBulkStart.addEventListener("click", startBulk);
   btnBulkStop.addEventListener("click", () => stopBulk("Bulk stopped."));
   btnBulkSkip.addEventListener("click", skipCurrent);
@@ -728,6 +703,7 @@ btnProcess.addEventListener("click", async () => {
   try {
     btnExport.disabled = true;
     selectedRowKey = null;
+
     addedPoints = [];
     layerAdded.clearLayers();
     layerKMZ.clearLayers();
@@ -747,11 +723,10 @@ btnProcess.addEventListener("click", async () => {
 
     setStatus("Reading KMZ & parsing KML...");
     const { kmlText, kmlName } = await readKMZasKMLText(kmzFile.files[0]);
+    kmzKmlName = kmlName || "doc.kml";
     kmlDoc = parseXML(kmlText);
 
     const homeFolder = findFolderByPath(kmlDoc, ["HP","HOME"]);
-    homeFolderNode = homeFolder;
-
     if (homeFolder) kmzPoints = extractPlacemarkPoints(homeFolder);
     else kmzPoints = extractPlacemarkPoints(kmlDoc);
 
@@ -769,10 +744,9 @@ btnProcess.addEventListener("click", async () => {
     btnExport.disabled = false;
 
     setStatus(
-      `Done.\nCSV rows: ${total}\nMATCHED: ${nMatched}\nREVIEW: ${nReview}\nREVIEW_ADD: ${nReviewAdd}\nMISSING: ${nMissing}\n\nPilih street → Start Bulk untuk add cepat.`
+      `Done.\nCSV rows: ${total}\nMATCHED: ${nMatched}\nREVIEW: ${nReview}\nREVIEW_ADD: ${nReviewAdd}\nMISSING: ${nMissing}\n\nExport akan menambah folder REBUILD_HELPER/MATCHED saja.`
     );
 
-    // default selection: first missing if exists
     const firstMissingIdx = matches.findIndex(m => m.status === "MISSING" || m.status === "REVIEW_ADD");
     if (firstMissingIdx >= 0) {
       selectedRowKey = firstMissingIdx;
@@ -790,9 +764,9 @@ btnProcess.addEventListener("click", async () => {
 btnExport.addEventListener("click", async () => {
   try {
     if (!kmlDoc) throw new Error("Belum ada data untuk diexport. Klik Process dulu.");
-    setStatus("Exporting KMZ updated...");
-    await exportUpdatedKMZ("doc.kml");
-    setStatus("Export done: ABD_KMZ_UPDATED.kmz");
+    setStatus("Exporting KMZ (add MATCHED folder only)...");
+    await exportKMZ_AddMatchedFolderOnly();
+    setStatus("Export done: ABD_KMZ_UPDATED.kmz\nFolder baru: REBUILD_HELPER/MATCHED");
   } catch (err) {
     setStatus(`ERROR: ${err.message || err}`);
   }
